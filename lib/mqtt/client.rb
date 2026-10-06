@@ -4,6 +4,14 @@ autoload :URI, 'uri'
 # Client class for talking to an MQTT server
 module MQTT
   class Client
+    # A logical subscription: a topic filter, granted QoS, shared group and identifier
+    Subscription = Struct.new(:filter, :qos, :group, :identifier) do
+      # Returns true if this is a shared subscription ($share/group/filter)
+      def shared?
+        !group.nil?
+      end
+    end
+
     # Hostname of the remote server
     attr_accessor :host
 
@@ -177,9 +185,19 @@ module MQTT
       @socket = nil
       @read_queue = Queue.new
       @pubacks = {}
+      @subscriptions = {}
+      @subscription_identifiers = {}
+      @pending_subscribes = {}
+      @pending_unsubscribes = {}
       @read_thread = nil
       @write_semaphore = Mutex.new
       @pubacks_semaphore = Mutex.new
+      @subscriptions_semaphore = Mutex.new
+    end
+
+    # Set the MQTT protocol version (accepts 5 or '5' as an alias for '5.0')
+    def version=(arg)
+      @version = arg.to_s == '5' ? '5.0' : arg.to_s
     end
 
     # Get the OpenSSL context, that is used if SSL/TLS is enabled
@@ -373,11 +391,39 @@ module MQTT
     #   client.subscribe( ['a/b',0], ['c/d',1] )
     #   client.subscribe( 'a/b' => 0, 'c/d' => 1 )
     #
-    def subscribe(*topics)
+    def subscribe(*args, **options)
+      identifier = options[:identifier]
+      # Ruby 3 routes a trailing String-keyed Hash into keyword options
+      topic_hash = options.select { |key, _value| key.is_a?(String) }
+      args << topic_hash unless topic_hash.empty?
+
+      options.each_key do |key|
+        next if key == :identifier
+        next if key.is_a?(String)
+
+        raise ArgumentError, "unknown keyword: #{key.inspect}"
+      end
+
+      if !identifier.nil? && @version != '5.0'
+        raise ArgumentError, 'Subscription identifiers are only supported with MQTT version 5'
+      end
+
+      topics = args
       packet = MQTT::Packet::Subscribe.new(
         :id => next_packet_id,
-        :topics => topics
+        :topics => topics,
+        :version => @version
       )
+      packet.subscription_identifier = identifier unless identifier.nil?
+
+      # Remember the filters requested, so that the mapping can be updated
+      # when the SUBACK is received (only successful filters are registered)
+      @subscriptions_semaphore.synchronize do
+        @pending_subscribes[packet.id] = packet.topics.map do |filter, qos|
+          Subscription.new(filter, qos, MQTT::Topic.split_shared(filter).first, packet.subscription_identifier)
+        end
+      end
+
       send_packet(packet)
     end
 
@@ -438,6 +484,58 @@ module MQTT
       end
     end
 
+    # Returns the list of logical subscriptions that an incoming PUBLISH
+    # packet matched.
+    #
+    # Matches based on the subscription identifiers returned by the server
+    # when present, otherwise by matching the topic against the local filters.
+    def matched_subscriptions(packet)
+      @subscriptions_semaphore.synchronize do
+        matches = []
+
+        identifiers = packet.respond_to?(:subscription_identifiers) ? packet.subscription_identifiers : []
+
+        if identifiers.empty?
+          # No subscription identifiers: dispatch by matching the topic locally
+          @subscriptions.each_value do |subscription|
+            matches << subscription if MQTT::Topic.match?(subscription.filter, packet.topic)
+          end
+        else
+          # Dispatch strictly on the identifiers returned by the server
+          identifiers.each do |identifier|
+            filters = @subscription_identifiers[identifier] || []
+            filters.each { |filter| matches << @subscriptions[filter] }
+          end
+        end
+
+        matches.compact.uniq { |subscription| subscription.filter }
+      end
+    end
+
+    # Yields one message event per incoming PUBLISH packet, together with the
+    # list of logical subscriptions that the message matched.
+    #
+    # A packet that matches several subscriptions produces a single message
+    # event with all the matching subscriptions listed, never duplicate events.
+    #
+    # Example:
+    #   client.each_message do |topic, payload, subscriptions|
+    #     subscriptions.each { |subscription| ... }
+    #   end
+    def each_message
+      get_packet do |packet|
+        subscriptions = matched_subscriptions(packet)
+        yield(packet.topic, packet.payload, subscriptions)
+      end
+    end
+
+    # Returns a single incoming PUBLISH packet as [topic, payload, subscriptions].
+    # See #each_message for the semantics of the subscriptions list.
+    def get_message
+      packet = get_packet
+      [packet.topic, packet.payload, matched_subscriptions(packet)]
+    end
+
     # Returns true if the incoming message queue is empty.
     def queue_empty?
       @read_queue.empty?
@@ -459,8 +557,12 @@ module MQTT
 
       packet = MQTT::Packet::Unsubscribe.new(
         :topics => topics,
-        :id => next_packet_id
+        :id => next_packet_id,
+        :version => @version
       )
+      @subscriptions_semaphore.synchronize do
+        @pending_unsubscribes[packet.id] = Array(topics)
+      end
       send_packet(packet)
     end
 
@@ -474,7 +576,7 @@ module MQTT
       handle_timeouts
       unless result.nil?
         # Yes - read in the packet
-        packet = MQTT::Packet.read(@socket)
+        packet = MQTT::Packet.read(@socket, @version)
         handle_packet packet
       end
       keep_alive!
@@ -504,9 +606,57 @@ module MQTT
         @pubacks_semaphore.synchronize do
           @pubacks[packet.id] << packet if @pubacks[packet.id]
         end
+      elsif packet.class == MQTT::Packet::Suback
+        handle_suback(packet)
+      elsif packet.class == MQTT::Packet::Unsuback
+        handle_unsuback(packet)
       end
       # Ignore all other packets
       # FIXME: implement responses for QoS  2
+    end
+
+    # Update the local subscription mapping from the result codes of a SUBACK
+    def handle_suback(packet)
+      @subscriptions_semaphore.synchronize do
+        requested = @pending_subscribes.delete(packet.id)
+        return if requested.nil?
+
+        requested.each_with_index do |subscription, index|
+          code = packet.return_codes[index]
+          next if code.nil? || code >= 0x80
+
+          subscription = Subscription.new(subscription.filter, code, subscription.group, subscription.identifier)
+          @subscriptions[subscription.filter] = subscription
+          next if subscription.identifier.nil?
+
+          @subscription_identifiers[subscription.identifier] ||= []
+          @subscription_identifiers[subscription.identifier] << subscription.filter
+          @subscription_identifiers[subscription.identifier].uniq!
+        end
+      end
+    end
+
+    # Update the local subscription mapping after an UNSUBACK is received
+    def handle_unsuback(packet)
+      @subscriptions_semaphore.synchronize do
+        filters = @pending_unsubscribes.delete(packet.id)
+        return if filters.nil?
+
+        filters.each_with_index do |filter, index|
+          # MQTT 5 reports a per-filter reason code; 0x00 is success.
+          code = packet.respond_to?(:reason_codes) ? packet.reason_codes[index] : nil
+          next unless code.nil? || code == 0x00
+
+          subscription = @subscriptions.delete(filter)
+          next if subscription.nil? || subscription.identifier.nil?
+
+          list = @subscription_identifiers[subscription.identifier]
+          next if list.nil?
+
+          list.delete(filter)
+          @subscription_identifiers.delete(subscription.identifier) if list.empty?
+        end
+      end
     end
 
     def handle_timeouts
@@ -546,13 +696,13 @@ module MQTT
     end
 
     def puback_packet(packet)
-      send_packet(MQTT::Packet::Puback.new(:id => packet.id))
+      send_packet(MQTT::Packet::Puback.new(:id => packet.id, :version => @version))
     end
 
     # Read and check a connection acknowledgement packet
     def receive_connack
       Timeout.timeout(@ack_timeout) do
-        packet = MQTT::Packet.read(@socket)
+        packet = MQTT::Packet.read(@socket, @version)
         if packet.class != MQTT::Packet::Connack
           raise MQTT::ProtocolException, "Response wasn't a connection acknowledgement: #{packet.class}"
         end

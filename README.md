@@ -162,6 +162,31 @@ end
 For more information see the [MQTT::Client#get] method.
 
 
+### MQTT version 5 subscription identifiers ###
+
+When connected using MQTT version 5 (`:version => '5.0'`), a subscription may be
+given a subscription identifier, which the server echoes back on matching PUBLISH
+packets:
+
+~~~ ruby
+client = MQTT::Client.connect('myserver.example.com', :version => '5.0') do |client|
+  client.subscribe('sport/+', 'sport/#', :identifier => 7)
+  client.subscribe('other/+', :identifier => 8)
+
+  client.each_message do |topic, payload, subscriptions|
+    # One event per packet; subscriptions lists every logical subscription
+    # the packet matched (a packet is never delivered more than once)
+    subscriptions.each do |subscription|
+      puts "#{subscription.identifier}: #{topic} (qos #{subscription.qos})"
+    end
+  end
+end
+~~~
+
+The group name of a shared subscription (`$share/group/filter`) is not used when
+matching topics - only the filter after the group name participates in matching.
+
+
 ### Parsing and serialising of packets ###
 
 The parsing and serialising of MQTT and MQTT-SN packets is a separate lower-level API.
@@ -236,4 +261,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-
