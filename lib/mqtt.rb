@@ -32,6 +32,7 @@ module MQTT
   autoload :Client,   'mqtt/client'
   autoload :Packet,   'mqtt/packet'
   autoload :Proxy,    'mqtt/proxy'
+  autoload :SessionStore, 'mqtt/session_store'
 
   # MQTT-SN
   module SN

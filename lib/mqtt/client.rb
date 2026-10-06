@@ -62,6 +62,11 @@ module MQTT
     # Last ping response time
     attr_reader :last_ping_response
 
+    # Set the store used to persist QoS 2 handshake state between
+    # connections. Inject your own MQTT::SessionStore subclass to
+    # make the session survive a process restart.
+    attr_writer :session_store
+
     # Timeout between select polls (in seconds)
     SELECT_TIMEOUT = 0.5
 
@@ -82,7 +87,8 @@ module MQTT
       :will_qos => 0,
       :will_retain => false,
       :ssl => false,
-      :verify_host => true
+      :verify_host => true,
+      :session_store => nil
     }
 
     # Create and connect a new MQTT Client
@@ -187,6 +193,12 @@ module MQTT
       @ssl_context ||= OpenSSL::SSL::SSLContext.new
     end
 
+    # The store used to persist QoS 2 handshake state between
+    # connections (defaults to an in-memory store)
+    def session_store
+      @session_store ||= MQTT::SessionStore::Memory.new
+    end
+
     # Set a path to a file containing a PEM-format client certificate
     def cert_file=(path)
       self.cert = File.read(path)
@@ -286,6 +298,15 @@ module MQTT
           Thread.current[:parent] = parent
           receive_packet while connected?
         end
+
+        if @clean_session
+          # Clean Session: discard any state from a previous session
+          session_store.clear
+          @last_packet_id = nil
+        else
+          # Persistent session: resume interrupted QoS 2 handshakes
+          resume_session
+        end
       end
 
       return unless block_given?
@@ -335,6 +356,10 @@ module MQTT
         :payload => payload
       )
 
+      # Store the packet before sending it, so that a QoS 2 exchange
+      # can be resumed from this point if the connection drops
+      session_store.store_outgoing(packet) if qos == 2
+
       queue = qos.zero? ? nil : wait_for_puback(packet.id)
 
       res = send_packet(packet)
@@ -350,10 +375,16 @@ module MQTT
           return -1 if current_time > deadline
         when :close
           return -1
+        when MQTT::Packet::Pubrec
+          # Continue the QoS 2 handshake: PUBREC -> PUBREL
+          session_store.mark_outgoing_pubrel(packet.id)
+          send_packet(MQTT::Packet::Pubrel.new(:id => packet.id))
         else
           @pubacks_semaphore.synchronize do
             @pubacks.delete packet.id
           end
+          # The QoS 2 handshake is complete once the PUBCOMP arrives
+          session_store.delete_outgoing(packet.id) if response.is_a?(MQTT::Packet::Pubcomp)
           break
         end
       end
@@ -496,17 +527,64 @@ module MQTT
 
     def handle_packet(packet)
       if packet.class == MQTT::Packet::Publish
-        # Add to queue
-        @read_queue.push(packet)
+        handle_publish(packet)
       elsif packet.class == MQTT::Packet::Pingresp
         @last_ping_response = current_time
-      elsif packet.class == MQTT::Packet::Puback
-        @pubacks_semaphore.synchronize do
-          @pubacks[packet.id] << packet if @pubacks[packet.id]
-        end
+      elsif packet.class == MQTT::Packet::Pubrel
+        handle_pubrel(packet)
+      elsif packet.class == MQTT::Packet::Puback ||
+            packet.class == MQTT::Packet::Pubrec ||
+            packet.class == MQTT::Packet::Pubcomp
+        handle_ack(packet)
       end
       # Ignore all other packets
-      # FIXME: implement responses for QoS  2
+    end
+
+    # Handle a PUBLISH packet received from the server
+    def handle_publish(packet)
+      if packet.qos == 2
+        # Remember the packet the first time it arrives, so that
+        # duplicates are acknowledged but never delivered twice
+        session_store.store_incoming(packet) if session_store.incoming_state(packet.id).nil?
+        send_packet(MQTT::Packet::Pubrec.new(:id => packet.id))
+      else
+        # Add to queue
+        @read_queue.push(packet)
+      end
+    end
+
+    # Handle a PUBREL packet: the last step of an incoming QoS 2
+    # handshake. The message is handed to the application only the
+    # first time a PUBREL arrives for its packet identifier.
+    def handle_pubrel(packet)
+      stored = nil
+      if session_store.incoming_state(packet.id) == :pubrec
+        stored = session_store.mark_incoming_pubcomp(packet.id)
+      end
+      # Always complete the handshake, even for duplicate PUBRELs
+      send_packet(MQTT::Packet::Pubcomp.new(:id => packet.id))
+      @read_queue.push(stored) unless stored.nil?
+    end
+
+    # Handle a PUBACK/PUBREC/PUBCOMP for a packet sent by us
+    def handle_ack(packet)
+      queue = @pubacks_semaphore.synchronize do
+        @pubacks[packet.id]
+      end
+
+      if queue
+        # A publish call is waiting for this acknowledgement
+        queue << packet
+      elsif packet.class == MQTT::Packet::Pubrec
+        # No local waiter: advance a restored session's handshake
+        # (a duplicate PUBREC is answered with another PUBREL)
+        unless session_store.outgoing_state(packet.id).nil?
+          session_store.mark_outgoing_pubrel(packet.id)
+          send_packet(MQTT::Packet::Pubrel.new(:id => packet.id))
+        end
+      elsif packet.class == MQTT::Packet::Pubcomp
+        session_store.delete_outgoing(packet.id)
+      end
     end
 
     def handle_timeouts
@@ -546,7 +624,23 @@ module MQTT
     end
 
     def puback_packet(packet)
-      send_packet(MQTT::Packet::Puback.new(:id => packet.id))
+      # QoS 2 packets are acknowledged by the PUBREC/PUBREL/PUBCOMP
+      # handshake before they reach the read queue
+      send_packet(MQTT::Packet::Puback.new(:id => packet.id)) if packet.qos == 1
+    end
+
+    # Re-send packets for unfinished outgoing QoS 2 exchanges,
+    # continuing each handshake from the stage it had reached, as
+    # required when resuming a persistent session (MQTT 3.1.1 4.4)
+    def resume_session
+      session_store.each_outgoing do |state, packet|
+        if state == :pubrel
+          send_packet(MQTT::Packet::Pubrel.new(:id => packet.id))
+        else
+          packet.duplicate = true
+          send_packet(packet)
+        end
+      end
     end
 
     # Read and check a connection acknowledgement packet
@@ -598,8 +692,13 @@ module MQTT
     end
 
     def next_packet_id
-      @last_packet_id = (@last_packet_id || 0).next
-      @last_packet_id = 1 if @last_packet_id > 0xffff
+      begin
+        @last_packet_id = (@last_packet_id || session_store.last_packet_id || 0).next
+        @last_packet_id = 1 if @last_packet_id > 0xffff
+        # The outgoing packet id space must not clash with
+        # identifiers still used by unfinished QoS 2 exchanges
+      end while session_store.outgoing_id?(@last_packet_id)
+      session_store.last_packet_id = @last_packet_id
       @last_packet_id
     end
 

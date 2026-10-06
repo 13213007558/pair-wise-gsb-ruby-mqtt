@@ -1,6 +1,17 @@
 Ruby MQTT NEWS
 ==============
 
+Unreleased
+----------
+
+* Added QoS 2 support (PUBREC/PUBREL/PUBCOMP handshake) for
+  publishing and receiving
+* Added an injectable session store (MQTT::SessionStore) that
+  persists QoS 2 handshake state so persistent sessions
+  (Clean Session = 0) resume interrupted exchanges after a
+  reconnect instead of re-publishing messages
+
+
 Ruby MQTT Version 0.7.0 (2025-10-29)
 ------------------------------------
 

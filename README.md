@@ -190,9 +190,35 @@ socket.close
 Limitations
 -----------
 
- * QoS 2 is not currently supported by client
  * Automatic re-connects to the server are not supported
- * No local persistence for packets
+ * QoS 2 session state is kept in memory unless a custom
+   MQTT::SessionStore is injected (see below)
+
+
+QoS 2 Sessions
+--------------
+
+QoS 2 is supported for both publishing and receiving. The client
+tracks the state of every QoS 2 handshake (PUBLISH, PUBREC, PUBREL,
+PUBCOMP) in a session store, so an interrupted exchange is resumed
+from the stage it reached instead of re-publishing the message, as
+required by MQTT 3.1.1.
+
+By default the state is kept in memory. To survive a process
+restart, inject your own MQTT::SessionStore implementation and
+connect with a persistent session (Clean Session = 0):
+
+~~~ ruby
+client = MQTT::Client.connect(
+  :host => 'myserver.example.com',
+  :clean_session => false,
+  :client_id => 'my-client',
+  :session_store => MyFileSessionStore.new('session.db')
+)
+~~~
+
+Connecting with Clean Session = 1 discards any stored state and
+starts a fresh session.
 
 
 Resources
@@ -236,4 +262,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-
