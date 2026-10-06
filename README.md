@@ -187,6 +187,36 @@ socket << MQTT::SN::Packet::Publish.new(
 socket.close
 ~~~
 
+### MQTT-SN will sessions ###
+
+An embedded client can drive MQTT-SN will negotiation and updates with send and
+receive callbacks. Both callbacks use binary packets, while the existing
+`MQTT::SN::Packet` codec performs all encoding and parsing:
+
+~~~ ruby
+session = MQTT::SN::WillSession.new(
+  :send_packet => proc { |binary| socket.write(binary) },
+  :receive_packet => proc { socket.recv(700) }
+)
+
+session.connect(
+  :client_id => 'sensor-1',
+  :topic => 'sensors/1/will',
+  :message => 'offline',
+  :qos => 1,
+  :retain => true
+)
+
+result = session.update_will(
+  :topic => 'sensors/1/will',
+  :message => 'moved',
+  :qos => 2
+)
+result.topic_ack.accepted?
+result.message_ack.accepted?
+session.clear_will
+~~~
+
 Limitations
 -----------
 
@@ -236,4 +266,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-

@@ -334,7 +334,7 @@ module MQTT
         attr_accessor :data
 
         def encode_body
-          data
+          data.to_s
         end
 
         def parse_body(buffer)
@@ -659,7 +659,7 @@ module MQTT
         attr_accessor :data
 
         def encode_body
-          data
+          data.to_s
         end
 
         def parse_body(buffer)

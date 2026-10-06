@@ -44,5 +44,6 @@ module MQTT
     end
 
     autoload :Packet, 'mqtt/sn/packet'
+    autoload :WillSession, 'mqtt/sn/will_session'
   end
 end
