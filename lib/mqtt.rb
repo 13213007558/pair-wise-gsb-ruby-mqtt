@@ -30,6 +30,7 @@ module MQTT
   end
 
   autoload :Client,   'mqtt/client'
+  autoload :InMemorySessionStore, 'mqtt/session_store'
   autoload :Packet,   'mqtt/packet'
   autoload :Proxy,    'mqtt/proxy'
 

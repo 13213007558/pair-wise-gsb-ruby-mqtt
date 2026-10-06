@@ -117,6 +117,22 @@ end
 For more information, see and list of attributes for the [MQTT::Client] class and the [MQTT::Client.connect] method.
 
 
+### Persistent sessions ###
+
+Set `clean_session` to `false` and provide a session store to continue QoS 1 and QoS 2 handshakes after reconnecting. The built-in store is process-local; pass the same object to a replacement client to simulate a restart, or provide an object responding to `load_session`, `save_session` and `delete_session` for durable storage.
+
+~~~ ruby
+session_store = MQTT::InMemorySessionStore.new
+client = MQTT::Client.new(
+  :host => 'myserver.example.com',
+  :client_id => 'persistent-client',
+  :clean_session => false,
+  :session_store => session_store
+)
+client.connect
+~~~
+
+
 ### Publishing ###
 
 To send a message to a topic, use the ```publish``` method:
@@ -190,9 +206,8 @@ socket.close
 Limitations
 -----------
 
- * QoS 2 is not currently supported by client
  * Automatic re-connects to the server are not supported
- * No local persistence for packets
+ * The built-in session store is in-memory only
 
 
 Resources
@@ -236,4 +251,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-

@@ -716,9 +716,20 @@ describe MQTT::Client do
     end
 
     it "should write a valid PUBLISH packet to the socket with the QoS set to 2" do
-      inject_puback(1)
+      allow(client).to receive(:send_packet).and_wrap_original do |send_packet, packet, *args, &block|
+        if packet.is_a?(MQTT::Packet::Pubrel)
+          Thread.new { client.send(:handle_packet, MQTT::Packet::Pubcomp.new(:id => packet.id)) }
+        elsif packet.is_a?(MQTT::Packet::Publish)
+          Thread.new { client.send(:handle_packet, MQTT::Packet::Pubrec.new(:id => packet.id)) }
+        end
+        send_packet.call(packet, *args, &block)
+      end
+
       client.publish('topic','payload', false, 2)
-      expect(socket.string).to eq("\x34\x10\x00\x05topic\x00\x01payload")
+      expect(socket.string).to eq(
+        "\x34\x10\x00\x05topic\x00\x01payload" +
+        "\x62\x02\x00\x01"
+      )
     end
 
     it "should write a valid PUBLISH packet with no payload" do

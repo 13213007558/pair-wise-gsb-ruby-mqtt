@@ -35,6 +35,9 @@ module MQTT
     # Client Identifier
     attr_accessor :client_id
 
+    # Storage used to persist MQTT session state
+    attr_accessor :session_store
+
     # Number of seconds to wait for acknowledgement packets (default is 5 seconds)
     attr_accessor :ack_timeout
 
@@ -73,6 +76,7 @@ module MQTT
       :keep_alive => 15,
       :clean_session => true,
       :client_id => nil,
+      :session_store => nil,
       :ack_timeout => 5,
       :connect_timeout => 30,
       :username => nil,
@@ -180,6 +184,12 @@ module MQTT
       @read_thread = nil
       @write_semaphore = Mutex.new
       @pubacks_semaphore = Mutex.new
+      @session_semaphore = Mutex.new
+      @session = empty_session
+    end
+
+    def session_store=(store)
+      @session_store = store || MQTT::InMemorySessionStore.new
     end
 
     # Get the OpenSSL context, that is used if SSL/TLS is enabled
@@ -279,7 +289,23 @@ module MQTT
         send_packet(packet)
 
         # Receive response
-        receive_connack
+        connack = receive_connack
+
+        if @clean_session && connack&.session_present
+          @socket.close
+          raise MQTT::ProtocolException, 'Clean Session must not be resumed by the server'
+        end
+
+        @read_queue = Queue.new
+        @pubacks = {}
+
+        if connack.nil? || @clean_session || !connack.session_present
+          reset_session!
+        else
+          restore_session!
+        end
+
+        resume_session!
 
         # Start packet reading thread
         @read_thread = Thread.new(Thread.current) do |parent|
@@ -311,6 +337,7 @@ module MQTT
       if send_msg
         packet = MQTT::Packet::Disconnect.new
         send_packet(packet)
+        reset_session!
       end
       @socket.close unless @socket.nil?
       handle_close
@@ -335,11 +362,12 @@ module MQTT
         :payload => payload
       )
 
+      remember_outgoing_publish(packet) unless qos.zero?
       queue = qos.zero? ? nil : wait_for_puback(packet.id)
 
       res = send_packet(packet)
 
-      return unless queue
+      return res unless queue
 
       deadline = current_time + @ack_timeout
 
@@ -350,10 +378,13 @@ module MQTT
           return -1 if current_time > deadline
         when :close
           return -1
+        when MQTT::Packet::Pubrec
+          next if qos == 2
+        when MQTT::Packet::Pubcomp
+          complete_outgoing(packet.id)
+          break
         else
-          @pubacks_semaphore.synchronize do
-            @pubacks.delete packet.id
-          end
+          complete_outgoing(packet.id)
           break
         end
       end
@@ -427,13 +458,15 @@ module MQTT
         # Loop forever!
         loop do
           packet = @read_queue.pop
+          prepare_received_publish(packet)
           yield(packet)
-          puback_packet(packet) if packet.qos > 0
+          send_received_publish_acknowledgement(packet)
         end
       else
         # Wait for one packet to be available
         packet = @read_queue.pop
-        puback_packet(packet) if packet.qos > 0
+        prepare_received_publish(packet)
+        send_received_publish_acknowledgement(packet)
         return packet
       end
     end
@@ -496,17 +529,99 @@ module MQTT
 
     def handle_packet(packet)
       if packet.class == MQTT::Packet::Publish
-        # Add to queue
-        @read_queue.push(packet)
+        handle_incoming_publish(packet)
       elsif packet.class == MQTT::Packet::Pingresp
         @last_ping_response = current_time
       elsif packet.class == MQTT::Packet::Puback
-        @pubacks_semaphore.synchronize do
-          @pubacks[packet.id] << packet if @pubacks[packet.id]
+        complete_outgoing(packet.id)
+      elsif packet.class == MQTT::Packet::Pubrec
+        handle_incoming_pubrec(packet.id)
+      elsif packet.class == MQTT::Packet::Pubrel
+        handle_incoming_pubrel(packet.id)
+      elsif packet.class == MQTT::Packet::Pubcomp
+        complete_outgoing(packet.id)
+      end
+    end
+
+    def handle_incoming_publish(packet)
+      return @read_queue.push(packet) unless packet.qos == 2
+
+      @session_semaphore.synchronize do
+        state = @session['incoming_publishes'][packet.id]
+        if state.nil?
+          @session['incoming_publishes'][packet.id] = {
+            'state' => 'queued',
+            'packet' => serialize_publish(packet)
+          }
+          persist_session!
+          @read_queue.push(packet)
+        elsif state['state'] == 'queued'
+          # The original packet is still waiting to be given to the application.
+        else
+          response_class = if state['state'] == 'pubcomp'
+                             MQTT::Packet::Pubcomp
+                           else
+                             MQTT::Packet::Pubrec
+                           end
+          send_packet(response_class.new(:id => packet.id))
         end
       end
-      # Ignore all other packets
-      # FIXME: implement responses for QoS  2
+    end
+
+    def handle_incoming_pubrec(id)
+      queue = nil
+      @session_semaphore.synchronize do
+        publish = @session['outgoing_publishes'][id]
+        if publish && publish['packet']['qos'] == 2
+          publish['state'] = 'pubrel'
+          persist_session!
+          send_packet(MQTT::Packet::Pubrel.new(:id => id))
+        end
+      end
+      @pubacks_semaphore.synchronize do
+        queue = @pubacks[id]
+      end
+      queue&.<<(:pubrel_sent)
+    end
+
+    def handle_incoming_pubrel(id)
+      state = nil
+      @session_semaphore.synchronize do
+        state = @session['incoming_publishes'][id]
+        if state
+          if state['state'] == 'queued' || state['state'] == 'delivered'
+            send_packet(MQTT::Packet::Pubrec.new(:id => id))
+            return
+          end
+
+          state['state'] = 'pubcomp'
+          state.delete('packet')
+          persist_session!
+          send_packet(MQTT::Packet::Pubcomp.new(:id => id))
+        else
+          send_packet(MQTT::Packet::Pubcomp.new(:id => id))
+        end
+      end
+      complete_incoming(id) if state
+    end
+
+    def complete_outgoing(id)
+      queue = nil
+      @session_semaphore.synchronize do
+        @session['outgoing_publishes'].delete(id)
+        persist_session!
+      end
+      @pubacks_semaphore.synchronize do
+        queue = @pubacks.delete(id)
+      end
+      queue&.<<(:acknowledged)
+    end
+
+    def complete_incoming(id)
+      @session_semaphore.synchronize do
+        @session['incoming_publishes'].delete(id)
+        persist_session!
+      end
     end
 
     def handle_timeouts
@@ -519,6 +634,7 @@ module MQTT
       @pubacks_semaphore.synchronize do
         @pubacks.each_value { |q| q << :close }
       end
+      reset_session! if @clean_session
     end
 
     if Process.const_defined? :CLOCK_MONOTONIC
@@ -545,8 +661,40 @@ module MQTT
       end
     end
 
-    def puback_packet(packet)
-      send_packet(MQTT::Packet::Puback.new(:id => packet.id))
+    def prepare_received_publish(packet)
+      return if packet.qos.zero?
+
+      return unless packet.qos == 2
+
+      @session_semaphore.synchronize do
+        state = @session['incoming_publishes'][packet.id]
+        if state
+          state['state'] = 'delivered'
+          state.delete('packet')
+          persist_session!
+        end
+      end
+    end
+
+    def send_received_publish_acknowledgement(packet)
+      return if packet.qos.zero?
+
+      if packet.qos == 1
+        send_packet(MQTT::Packet::Puback.new(:id => packet.id))
+      else
+        send_packet(MQTT::Packet::Pubrec.new(:id => packet.id))
+        mark_incoming_pubrec_sent(packet.id)
+      end
+    end
+
+    def mark_incoming_pubrec_sent(id)
+      @session_semaphore.synchronize do
+        state = @session['incoming_publishes'][id]
+        if state && state['state'] == 'delivered'
+          state['state'] = 'pubrec_sent'
+          persist_session!
+        end
+      end
     end
 
     # Read and check a connection acknowledgement packet
@@ -564,6 +712,8 @@ module MQTT
           @socket.close
           raise MQTT::ProtocolException, packet.return_msg
         end
+
+        packet
       end
     end
 
@@ -598,9 +748,104 @@ module MQTT
     end
 
     def next_packet_id
-      @last_packet_id = (@last_packet_id || 0).next
-      @last_packet_id = 1 if @last_packet_id > 0xffff
-      @last_packet_id
+      @session_semaphore.synchronize do
+        begin
+          @session['outgoing_packet_id'] = (@session['outgoing_packet_id'] || 0).next
+          @session['outgoing_packet_id'] = 1 if @session['outgoing_packet_id'] > 0xffff
+        end while @session['outgoing_publishes'].key?(@session['outgoing_packet_id'])
+
+        persist_session!
+        @last_packet_id = @session['outgoing_packet_id']
+      end
+    end
+
+    def empty_session
+      {
+        'outgoing_packet_id' => 0,
+        'outgoing_publishes' => {},
+        'incoming_publishes' => {}
+      }
+    end
+
+    def reset_session!
+      @session_semaphore.synchronize do
+        @session = empty_session
+        session_store.delete_session(@client_id)
+        @last_packet_id = 0
+      end
+    end
+
+    def restore_session!
+      @session_semaphore.synchronize do
+        @session = session_store.load_session(@client_id) || empty_session
+        @last_packet_id = @session['outgoing_packet_id']
+      end
+    end
+
+    def persist_session!
+      return if @clean_session || @client_id.nil? || @client_id.empty?
+
+      session_store.save_session(@client_id, @session)
+    end
+
+    def remember_outgoing_publish(packet)
+      @session_semaphore.synchronize do
+        @session['outgoing_publishes'][packet.id] = {
+          'state' => 'publish',
+          'packet' => serialize_publish(packet)
+        }
+        persist_session!
+      end
+    end
+
+    def resume_session!
+      @session_semaphore.synchronize do
+        @session['incoming_publishes'].each do |id, state|
+          case state['state']
+          when 'queued'
+            @read_queue.push(deserialize_publish(state['packet']))
+          when 'delivered'
+            send_packet(MQTT::Packet::Pubrec.new(:id => id))
+          when 'pubrec_sent'
+            send_packet(MQTT::Packet::Pubrec.new(:id => id))
+          when 'pubcomp'
+            send_packet(MQTT::Packet::Pubcomp.new(:id => id))
+            @session['incoming_publishes'].delete(id)
+            persist_session!
+          end
+        end
+
+        @session['outgoing_publishes'].each do |id, state|
+          case state['state']
+          when 'publish'
+            packet = deserialize_publish(state['packet'])
+            packet.duplicate = true
+            send_packet(packet)
+          when 'pubrel'
+            send_packet(MQTT::Packet::Pubrel.new(:id => id))
+          end
+        end
+      end
+    end
+
+    def serialize_publish(packet)
+      {
+        'id' => packet.id,
+        'qos' => packet.qos,
+        'retain' => packet.retain,
+        'topic' => packet.topic,
+        'payload' => packet.payload
+      }
+    end
+
+    def deserialize_publish(data)
+      MQTT::Packet::Publish.new(
+        :id => data['id'],
+        :qos => data['qos'],
+        :retain => data['retain'],
+        :topic => data['topic'],
+        :payload => data['payload']
+      )
     end
 
     def open_tcp_socket
