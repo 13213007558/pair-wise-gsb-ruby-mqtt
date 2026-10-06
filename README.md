@@ -187,12 +187,47 @@ socket << MQTT::SN::Packet::Publish.new(
 socket.close
 ~~~
 
+### MQTT-SN client ###
+
+A lightweight MQTT-SN client state machine is available as MQTT::SN::Client.
+It supports gateway discovery (SEARCHGW/GWINFO/ADVERTISE), connecting,
+topic registration (REGISTER/REGACK) and publishing with QoS 0 and 1.
+Sleeping clients and QoS -1 publishing are not supported.
+
+The client performs no network I/O itself: outgoing packets are handed to a
+caller supplied UDP transport object and incoming datagrams are fed back in.
+
+~~~ ruby
+# The transport must implement send(data, address), where address is nil
+# for broadcast during gateway discovery
+client = MQTT::SN::Client.new(
+  :client_id => 'my-sensor',
+  :transport => my_udp_transport
+)
+
+# Discover gateways, then connect to the first one
+client.search_gateway
+# ... pass received datagrams to client.receive(data, address) ...
+client.connect(client.gateways.first.id)
+
+# Publish to a normal topic name (registered with the gateway on demand)
+client.publish('sensors/temp', '21.5', :qos => 1)
+
+# Predefined and short topic representations are kept distinct
+client.publish(3, '21.5', :topic_id_type => :predefined)
+client.publish('T1', '21.5', :topic_id_type => :short)
+~~~
+
+Topic id registrations are only valid for the gateway that issued them,
+so they are discarded when the client connects to a different gateway.
+
 Limitations
 -----------
 
  * QoS 2 is not currently supported by client
  * Automatic re-connects to the server are not supported
  * No local persistence for packets
+ * MQTT-SN client: no sleeping clients, QoS -1, subscribing or Will support
 
 
 Resources
@@ -236,4 +271,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-
