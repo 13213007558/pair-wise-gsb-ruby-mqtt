@@ -23,12 +23,15 @@ module MQTT
       :body_length => nil
     }
 
-    # Read in a packet from a socket
-    def self.read(socket)
+    # Read in a packet from a socket.
+    # The protocol version of the connection can be passed in so that
+    # MQTT 5 bodies (with reason codes and properties) are parsed correctly.
+    def self.read(socket, version = nil)
       # Read in the packet header and create a new packet object
       packet = create_from_header(
         read_byte(socket)
       )
+      packet.version = version unless version.nil?
       packet.validate_flags
 
       # Read in the packet length
@@ -53,9 +56,12 @@ module MQTT
       packet
     end
 
-    # Parse buffer into new packet object
-    def self.parse(buffer)
+    # Parse buffer into new packet object.
+    # The protocol version of the connection can be passed in so that
+    # MQTT 5 bodies (with reason codes and properties) are parsed correctly.
+    def self.parse(buffer, version = nil)
       packet = parse_header(buffer)
+      packet.version = version unless version.nil?
       packet.parse_body(buffer)
       packet
     end
@@ -150,7 +156,15 @@ module MQTT
 
     # Set the protocol version number
     def version=(arg)
-      @version = arg.to_s
+      @version = case arg.to_s
+                 when '5', '5.0' then '5.0'
+                 else arg.to_s
+                 end
+    end
+
+    # Returns true when the packet is using the MQTT 5 protocol
+    def mqtt5?
+      version == '5.0'
     end
 
     # Set the length of the packet body
@@ -282,6 +296,201 @@ module MQTT
       str.force_encoding('UTF-8')
     end
 
+    # Encode a Variable Byte Integer (used by MQTT 5)
+    def encode_variable_int(value)
+      value = value.to_i
+      raise 'Variable byte integer cannot be negative' if value.negative?
+      raise 'Variable byte integer cannot be greater than 268435455' if value > 268_435_455
+
+      bytes = []
+      loop do
+        byte = value % 128
+        value /= 128
+        byte |= 0x80 if value > 0
+        bytes << byte
+        break if value.zero?
+      end
+      encode_bytes(*bytes)
+    end
+
+    # Remove a Variable Byte Integer from the front of the buffer
+    def shift_variable_int(buffer)
+      multiplier = 1
+      value = 0
+      pos = 0
+      loop do
+        raise ProtocolException, 'Malformed variable byte integer' if pos >= 4
+        byte = shift_byte(buffer)
+        value += (byte & 0x7F) * multiplier
+        return value if (byte & 0x80).zero?
+        multiplier *= 128
+        pos += 1
+      end
+    end
+
+    # Encode the MQTT 5 properties hash and return the bytes
+    # (including the length of the properties)
+    def encode_properties(properties)
+      body = properties_to_s(properties)
+      encode_variable_int(body.bytesize) + body
+    end
+
+    # Parse an MQTT 5 properties section from the buffer into a hash
+    def shift_properties(buffer)
+      length = shift_variable_int(buffer)
+      section = shift_data(buffer, length)
+      Properties.parse(section)
+    end
+
+    def properties_to_s(properties)
+      body = ''.dup
+      (properties || {}).each_pair do |key, value|
+        id, type = Properties.lookup(key)
+        Array(value).each { |item| body << Properties.encode(id, type, item) }
+      end
+      body.force_encoding('ASCII-8BIT')
+    end
+
+    # Codec for the MQTT 5 Properties field
+    module Properties
+      # Mapping of property name/identifier symbol to wire identifier and type
+      DEFINITIONS = [
+        [:payload_format_indicator,        0x01, :byte],
+        [:message_expiry_interval,         0x02, :int],
+        [:content_type,                    0x03, :string],
+        [:response_topic,                  0x08, :string],
+        [:correlation_data,                0x09, :binary],
+        [:subscription_identifier,         0x0B, :variable_int],
+        [:session_expiry_interval,         0x11, :int],
+        [:assigned_client_identifier,      0x12, :string],
+        [:server_keep_alive,               0x13, :short],
+        [:authentication_method,           0x15, :string],
+        [:authentication_data,             0x16, :binary],
+        [:request_problem_information,     0x17, :byte],
+        [:will_delay_interval,             0x18, :int],
+        [:request_response_information,     0x19, :byte],
+        [:response_information,            0x1A, :string],
+        [:server_reference,                0x1C, :string],
+        [:reason_string,                   0x1F, :string],
+        [:receive_maximum,                 0x21, :short],
+        [:topic_alias_maximum,             0x22, :short],
+        [:topic_alias,                     0x23, :short],
+        [:maximum_qos,                     0x24, :byte],
+        [:retain_available,                0x25, :byte],
+        [:user_property,                   0x26, :string_pair],
+        [:maximum_packet_size,             0x27, :int],
+        [:wildcard_subscription_available, 0x28, :byte],
+        [:subscription_identifier_available, 0x29, :byte],
+        [:shared_subscription_available,   0x2A, :byte]
+      ].freeze
+
+      BY_NAME = {}.tap do |hash|
+        DEFINITIONS.each { |name, id, type| hash[name] = [id, type] }
+      end.freeze
+
+      BY_ID = {}.tap do |hash|
+        DEFINITIONS.each { |name, id, type| hash[id] = [name, type] }
+      end.freeze
+
+      # Property names that may occur more than once in a packet
+      MULTI_VALUED = %i[subscription_identifier user_property].freeze
+
+      def self.lookup(key)
+        return BY_NAME.fetch(key.to_sym) if key.is_a?(Symbol) || key.is_a?(String)
+        BY_ID.fetch(key)
+      end
+
+      def self.encode(id, type, value)
+        name, = BY_ID.fetch(id)
+        [id].pack('C') + encode_value(name, type, value)
+      end
+
+      def self.encode_value(_name, type, value)
+        case type
+        when :byte then [value.to_i].pack('C')
+        when :short then [value.to_i].pack('n')
+        when :int then [value.to_i].pack('N')
+        when :variable_int
+          bytes = []
+          number = value.to_i
+          loop do
+            byte = number % 128
+            number /= 128
+            byte |= 0x80 if number > 0
+            bytes << byte
+            break if number.zero?
+          end
+          bytes.pack('C*')
+        when :string then encode_length_prefixed(value.to_s)
+        when :binary then encode_length_prefixed(value.to_s)
+        when :string_pair
+          key, val = value
+          encode_length_prefixed(key.to_s) + encode_length_prefixed(val.to_s)
+        else
+          raise "Unknown MQTT 5 property type: #{type}"
+        end
+      end
+
+      def self.encode_length_prefixed(str)
+        str = str.dup.force_encoding('ASCII-8BIT')
+        [str.bytesize].pack('n') + str
+      end
+
+      def self.parse(buffer)
+        properties = {}
+        until buffer.empty?
+          id = buffer.slice!(0...1).unpack1('C')
+          name, type = BY_ID.fetch(id) do
+            raise ProtocolException, "Unsupported MQTT 5 property identifier: 0x%02X" % id
+          end
+          value = parse_value(buffer, type)
+          store(properties, name, value)
+        end
+        properties
+      end
+
+      def self.parse_value(buffer, type)
+        case type
+        when :byte then buffer.slice!(0...1).unpack1('C')
+        when :short then buffer.slice!(0..1).unpack1('n')
+        when :int then buffer.slice!(0..3).unpack1('N')
+        when :variable_int then parse_variable_int(buffer)
+        when :string, :binary then parse_length_prefixed(buffer)
+        when :string_pair
+          key = parse_length_prefixed(buffer)
+          value = parse_length_prefixed(buffer)
+          [key, value]
+        else
+          raise "Unknown MQTT 5 property type: #{type}"
+        end
+      end
+
+      def self.parse_variable_int(buffer)
+        multiplier = 1
+        value = 0
+        4.times do |pos|
+          byte = buffer.slice!(0...1).unpack1('C')
+          value += (byte & 0x7F) * multiplier
+          return value if (byte & 0x80).zero?
+          multiplier *= 128
+          raise ProtocolException, 'Malformed variable byte integer' if pos == 3
+        end
+      end
+
+      def self.parse_length_prefixed(buffer)
+        length = buffer.slice!(0..1).unpack1('n')
+        buffer.slice!(0...length)
+      end
+
+      def self.store(properties, name, value)
+        if MULTI_VALUED.include?(name)
+          properties[name] = Array(properties[name]) + [value]
+        else
+          properties[name] = value
+        end
+      end
+    end
+
     ## PACKET SUBCLASSES ##
 
     # Class representing an MQTT Publish message
@@ -301,10 +510,14 @@ module MQTT
       # The data to be published
       attr_accessor :payload
 
+      # Hash of MQTT 5 properties (only used with protocol version 5.0)
+      attr_accessor :properties
+
       # Default attribute values
       ATTR_DEFAULTS = {
         :topic => nil,
-        :payload => ''
+        :payload => '',
+        :properties => {}
       }
 
       # Create a new Publish packet
@@ -351,6 +564,7 @@ module MQTT
         end
         body += encode_string(@topic)
         body += encode_short(@id) unless qos.zero?
+        body += encode_properties(@properties) if mqtt5?
         body += payload.to_s.dup.force_encoding('ASCII-8BIT')
         body
       end
@@ -360,7 +574,24 @@ module MQTT
         super(buffer)
         @topic = shift_string(buffer)
         @id = shift_short(buffer) unless qos.zero?
+        if mqtt5?
+          @properties = shift_properties(buffer)
+        else
+          @properties = {}
+        end
         @payload = buffer
+      end
+
+      # MQTT 5 Subscription Identifiers associated with the message.
+      # The server may include one or more identifiers, one for each
+      # matching logical subscription.
+      def subscription_identifiers
+        Array(@properties && @properties[:subscription_identifier])
+      end
+
+      def subscription_identifiers=(values)
+        @properties ||= {}
+        @properties[:subscription_identifier] = Array(values)
       end
 
       # Check that fixed header flags are valid for this packet type
@@ -378,7 +609,8 @@ module MQTT
           "r#{retain ? '1' : '0'}, " \
           "m#{id}, " \
           "'#{topic}', " \
-          "#{inspect_payload}>"
+          "#{inspect_payload}" \
+          "#{mqtt5? && !@properties.empty? ? ", #{@properties.inspect}" : ''}>"
       end
 
       protected
@@ -429,6 +661,12 @@ module MQTT
       attr_accessor :password
 
       # Default attribute values
+      # Hash of MQTT 5 connect properties
+      attr_accessor :properties
+
+      # Hash of MQTT 5 will properties
+      attr_accessor :will_properties
+
       ATTR_DEFAULTS = {
         :client_id => nil,
         :clean_session => true,
@@ -438,7 +676,9 @@ module MQTT
         :will_retain => false,
         :will_payload => '',
         :username => nil,
-        :password => nil
+        :password => nil,
+        :properties => {},
+        :will_properties => {}
       }
 
       # Create a new Client Connect packet
@@ -451,6 +691,9 @@ module MQTT
         elsif version == '3.1.1'
           self.protocol_name ||= 'MQTT'
           self.protocol_level ||= 0x04
+        elsif mqtt5?
+          self.protocol_name ||= 'MQTT'
+          self.protocol_level ||= 0x05
         else
           raise ArgumentError, "Unsupported protocol version: #{version}"
         end
@@ -483,14 +726,26 @@ module MQTT
         body += encode_bytes(@connect_flags)
 
         body += encode_short(@keep_alive)
+        body += encode_properties(@properties) if mqtt5?
         body += encode_string(@client_id)
         unless will_topic.nil?
+          body += encode_properties(@will_properties) if mqtt5?
           body += encode_string(@will_topic)
-          # The MQTT v3.1 specification says that the payload is a UTF-8 string
-          body += encode_string(@will_payload)
+          if mqtt5?
+            body += (@will_payload || '').to_s.dup.force_encoding('ASCII-8BIT')
+          else
+            # The MQTT v3.1 specification says that the payload is a UTF-8 string
+            body += encode_string(@will_payload)
+          end
         end
         body += encode_string(@username) unless @username.nil?
-        body += encode_string(@password) unless @password.nil?
+        if !@password.nil?
+          if mqtt5?
+            body += @password.to_s.dup.force_encoding('ASCII-8BIT')
+          else
+            body += encode_string(@password)
+          end
+        end
         body
       end
 
@@ -503,6 +758,8 @@ module MQTT
           @version = '3.1.0'
         elsif @protocol_name == 'MQTT' && @protocol_level == 4
           @version = '3.1.1'
+        elsif @protocol_name == 'MQTT' && @protocol_level == 5
+          @version = '5.0'
         else
           raise ProtocolException, "Unsupported protocol: #{@protocol_name}/#{@protocol_level}"
         end
@@ -510,20 +767,32 @@ module MQTT
         @connect_flags = shift_byte(buffer)
         @clean_session = ((@connect_flags & 0x02) >> 1) == 0x01
         @keep_alive = shift_short(buffer)
+        if mqtt5?
+          @properties = shift_properties(buffer)
+        else
+          @properties = {}
+        end
         @client_id = shift_string(buffer)
         if ((@connect_flags & 0x04) >> 2) == 0x01
           # Last Will and Testament
           @will_qos = ((@connect_flags & 0x18) >> 3)
           @will_retain = ((@connect_flags & 0x20) >> 5) == 0x01
+          @will_properties = shift_properties(buffer) if mqtt5?
           @will_topic = shift_string(buffer)
-          # The MQTT v3.1 specification says that the payload is a UTF-8 string
-          @will_payload = shift_string(buffer)
+          if mqtt5?
+            @will_payload = buffer
+            buffer = ''.dup
+          else
+            # The MQTT v3.1 specification says that the payload is a UTF-8 string
+            @will_payload = shift_string(buffer)
+          end
         end
         if ((@connect_flags & 0x80) >> 7) == 0x01 && buffer.bytesize > 0
           @username = shift_string(buffer)
         end
-        if ((@connect_flags & 0x40) >> 6) == 0x01 && buffer.bytesize > 0 # rubocop: disable Style/GuardClause
-          @password = shift_string(buffer)
+        if ((@connect_flags & 0x40) >> 6) == 0x01 && buffer.bytesize > 0
+          @password = mqtt5? ? buffer.dup : shift_string(buffer)
+          buffer.clear if mqtt5?
         end
       end
 
@@ -559,8 +828,11 @@ module MQTT
       # The return code (defaults to 0 for connection accepted)
       attr_accessor :return_code
 
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
       # Default attribute values
-      ATTR_DEFAULTS = { :return_code => 0x00 }
+      ATTR_DEFAULTS = { :return_code => 0x00, :properties => {} }
 
       # Create a new Client Connect packet
       def initialize(args = {})
@@ -604,6 +876,7 @@ module MQTT
         body = ''
         body += encode_bits(@connack_flags)
         body += encode_bytes(@return_code.to_i)
+        body += encode_properties(@properties) if mqtt5?
         body
       end
 
@@ -616,8 +889,13 @@ module MQTT
         end
         @return_code = shift_byte(buffer)
 
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Connect Acknowledgment packet'
+        if mqtt5?
+          @properties = shift_properties(buffer)
+        else
+          @properties = {}
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Connect Acknowledgment packet'
+        end
       end
 
       # Returns a human readable string, summarising the properties of the packet
@@ -628,45 +906,89 @@ module MQTT
 
     # Class representing an MQTT Publish Acknowledgment packet
     class Puback < MQTT::Packet
+      # MQTT 5 reason code (defaults to 0x00 - success)
+      attr_accessor :reason_code
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
+      ATTR_DEFAULTS = { :reason_code => 0x00, :properties => {} }
+
+      def initialize(args = {})
+        super(ATTR_DEFAULTS.merge(args))
+      end
+
       # Get serialisation of packet's body
       def encode_body
-        encode_short(@id)
+        body = encode_short(@id)
+        return body unless mqtt5?
+        body += encode_bytes(@reason_code.to_i)
+        body += encode_properties(@properties)
+        body
       end
 
       # Parse the body (variable header and payload) of a packet
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
-
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Publish Acknowledgment packet'
+        if mqtt5?
+          @reason_code = buffer.empty? ? 0x00 : shift_byte(buffer)
+          @properties = buffer.empty? ? {} : shift_properties(buffer)
+        else
+          @reason_code = nil
+          @properties = {}
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Publish Acknowledgment packet'
+        end
       end
 
       # Returns a human readable string, summarising the properties of the packet
       def inspect
-        "\#<#{self.class}: 0x%2.2X>" % id
+        "\#<#{self.class}: 0x%2.2X%s>" % [id, mqtt5? ? ", rc=0x%2.2X" % reason_code : '']
       end
     end
 
     # Class representing an MQTT Publish Received packet
     class Pubrec < MQTT::Packet
+      # MQTT 5 reason code (defaults to 0x00 - success)
+      attr_accessor :reason_code
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
+      ATTR_DEFAULTS = { :reason_code => 0x00, :properties => {} }
+
+      def initialize(args = {})
+        super(ATTR_DEFAULTS.merge(args))
+      end
+
       # Get serialisation of packet's body
       def encode_body
-        encode_short(@id)
+        body = encode_short(@id)
+        return body unless mqtt5?
+        body += encode_bytes(@reason_code.to_i)
+        body += encode_properties(@properties)
+        body
       end
 
       # Parse the body (variable header and payload) of a packet
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
-
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Publish Received packet'
+        if mqtt5?
+          @reason_code = buffer.empty? ? 0x00 : shift_byte(buffer)
+          @properties = buffer.empty? ? {} : shift_properties(buffer)
+        else
+          @reason_code = nil
+          @properties = {}
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Publish Received packet'
+        end
       end
 
       # Returns a human readable string, summarising the properties of the packet
       def inspect
-        "\#<#{self.class}: 0x%2.2X>" % id
+        "\#<#{self.class}: 0x%2.2X%s>" % [id, mqtt5? ? ", rc=0x%2.2X" % reason_code : '']
       end
     end
 
@@ -674,8 +996,16 @@ module MQTT
     class Pubrel < MQTT::Packet
       # Default attribute values
       ATTR_DEFAULTS = {
-        :flags => [false, true, false, false]
+        :flags => [false, true, false, false],
+        :reason_code => 0x00,
+        :properties => {}
       }
+
+      # MQTT 5 reason code
+      attr_accessor :reason_code
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
 
       # Create a new Pubrel packet
       def initialize(args = {})
@@ -684,16 +1014,26 @@ module MQTT
 
       # Get serialisation of packet's body
       def encode_body
-        encode_short(@id)
+        body = encode_short(@id)
+        return body unless mqtt5?
+        body += encode_bytes(@reason_code.to_i)
+        body += encode_properties(@properties)
+        body
       end
 
       # Parse the body (variable header and payload) of a packet
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
-
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Publish Release packet'
+        if mqtt5?
+          @reason_code = buffer.empty? ? 0x00 : shift_byte(buffer)
+          @properties = buffer.empty? ? {} : shift_properties(buffer)
+        else
+          @reason_code = nil
+          @properties = {}
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Publish Release packet'
+        end
       end
 
       # Check that fixed header flags are valid for this packet type
@@ -705,29 +1045,51 @@ module MQTT
 
       # Returns a human readable string, summarising the properties of the packet
       def inspect
-        "\#<#{self.class}: 0x%2.2X>" % id
+        "\#<#{self.class}: 0x%2.2X%s>" % [id, mqtt5? ? ", rc=0x%2.2X" % reason_code : '']
       end
     end
 
     # Class representing an MQTT Publish Complete packet
     class Pubcomp < MQTT::Packet
+      # MQTT 5 reason code
+      attr_accessor :reason_code
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
+      ATTR_DEFAULTS = { :reason_code => 0x00, :properties => {} }
+
+      def initialize(args = {})
+        super(ATTR_DEFAULTS.merge(args))
+      end
+
       # Get serialisation of packet's body
       def encode_body
-        encode_short(@id)
+        body = encode_short(@id)
+        return body unless mqtt5?
+        body += encode_bytes(@reason_code.to_i)
+        body += encode_properties(@properties)
+        body
       end
 
       # Parse the body (variable header and payload) of a packet
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
-
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Publish Complete packet'
+        if mqtt5?
+          @reason_code = buffer.empty? ? 0x00 : shift_byte(buffer)
+          @properties = buffer.empty? ? {} : shift_properties(buffer)
+        else
+          @reason_code = nil
+          @properties = {}
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Publish Complete packet'
+        end
       end
 
       # Returns a human readable string, summarising the properties of the packet
       def inspect
-        "\#<#{self.class}: 0x%2.2X>" % id
+        "\#<#{self.class}: 0x%2.2X%s>" % [id, mqtt5? ? ", rc=0x%2.2X" % reason_code : '']
       end
     end
 
@@ -736,15 +1098,23 @@ module MQTT
       # One or more topic filters to subscribe to
       attr_accessor :topics
 
+      # Per-filter MQTT 5 subscription options, in the same order as {#topics}
+      attr_reader :topic_options
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
       # Default attribute values
       ATTR_DEFAULTS = {
         :topics => [],
-        :flags => [false, true, false, false]
+        :flags => [false, true, false, false],
+        :properties => {}
       }
 
       # Create a new Subscribe packet
       def initialize(args = {})
         super(ATTR_DEFAULTS.merge(args))
+        @topic_options = [] if @topic_options.nil?
       end
 
       # Set one or more topic filters for the Subscribe packet
@@ -764,18 +1134,29 @@ module MQTT
         input = value.is_a?(Array) ? value.flatten : [value]
 
         @topics = []
+        @topic_options = []
         until input.empty?
           item = input.shift
           if item.is_a?(Hash)
             # Convert hash into an ordered array of arrays
-            @topics += item.sort
+            item.each do |filter, options|
+              options = options.is_a?(Hash) ? options : { :qos => options || 0 }
+              @topics << [filter, options_qos_byte(options)]
+              @topic_options << options
+            end
           elsif item.is_a?(String)
             # Peek at the next item in the array, and remove it if it is an integer
             if input.first.is_a?(Integer)
               qos = input.shift
               @topics << [item, qos]
+              @topic_options << { :qos => qos }
+            elsif input.first.is_a?(Hash)
+              options = input.shift
+              @topics << [item, options_qos_byte(options)]
+              @topic_options << options
             else
               @topics << [item, 0]
+              @topic_options << { :qos => 0 }
             end
           else
             # Meh?
@@ -785,13 +1166,42 @@ module MQTT
         @topics
       end
 
+      # The MQTT 5 Subscription Identifier of the SUBSCRIBE packet (if any)
+      def subscription_identifier
+        values = Array(@properties[:subscription_identifier])
+        values.first
+      end
+
+      def subscription_identifier=(value)
+        if value.nil?
+          @properties.delete(:subscription_identifier)
+        else
+          validate_subscription_identifier(value)
+          @properties[:subscription_identifier] = value
+        end
+      end
+
+      # Return just the topic filters, in subscription order
+      def topic_filters
+        @topics.map(&:first)
+      end
+
+      # Return the granted QoS values in subscription order
+      def requested_qos_levels
+        @topics.map { |_filter, options_byte| options_byte & 0x03 }
+      end
+
       # Get serialisation of packet's body
       def encode_body
         raise 'no topics given when serialising packet' if @topics.empty?
         body = encode_short(@id)
-        topics.each do |item|
+        body += encode_properties(@properties) if mqtt5?
+        @topics.each_with_index do |item, index|
           body += encode_string(item[0])
-          body += encode_bytes(item[1])
+          options = @topic_options[index] || { :qos => item[1] }
+          options = options.merge(:qos => item[1] & 0x03)
+          options_byte = mqtt5? ? encode_filter_options(options) : item[1]
+          body += encode_bytes(options_byte)
         end
         body
       end
@@ -800,11 +1210,13 @@ module MQTT
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
+        @properties = mqtt5? ? shift_properties(buffer) : {}
         @topics = []
         while buffer.bytesize > 0
           topic_name = shift_string(buffer)
           topic_qos = shift_byte(buffer)
-          @topics << [topic_name, topic_qos]
+          @topics << [topic_name, mqtt5? ? topic_qos & 0x03 : topic_qos]
+          @topic_options << { :qos => topic_qos & 0x03, :raw_options => topic_qos }
         end
       end
 
@@ -819,8 +1231,29 @@ module MQTT
       def inspect
         _str = "\#<#{self.class}: 0x%2.2X, %s>" % [
           id,
-          topics.map { |t| "'#{t[0]}':#{t[1]}" }.join(', ')
+          topics.map { |t| "'#{t[0]}':#{t[1] & 0x03}" }.join(', ')
         ]
+      end
+
+      private
+
+      def options_qos_byte(options)
+        options[:qos] ||= 0
+        options[:qos] & 0x03
+      end
+
+      def encode_filter_options(options)
+        byte = (options[:qos] & 0x03)
+        byte |= 0x04 if options[:no_local]
+        byte |= 0x08 if options[:retain_as_published]
+        retain_handling = (options[:retain_handling] || 0) & 0x03
+        byte | (retain_handling << 4)
+      end
+
+      def validate_subscription_identifier(value)
+        number = value.to_i
+        return if number >= 1 && number <= 268_435_455
+        raise ArgumentError, 'Subscription identifier must be between 1 and 268435455'
       end
     end
 
@@ -829,9 +1262,13 @@ module MQTT
       # An array of return codes, ordered by the topics that were subscribed to
       attr_accessor :return_codes
 
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
       # Default attribute values
       ATTR_DEFAULTS = {
-        :return_codes => []
+        :return_codes => [],
+        :properties => {}
       }
 
       # Create a new Subscribe Acknowledgment packet
@@ -857,6 +1294,7 @@ module MQTT
           raise 'no granted QoS given when serialising packet'
         end
         body = encode_short(@id)
+        body += encode_properties(@properties) if mqtt5?
         return_codes.each { |qos| body += encode_bytes(qos) }
         body
       end
@@ -865,6 +1303,7 @@ module MQTT
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
+        @properties = mqtt5? ? shift_properties(buffer) : {}
         @return_codes << shift_byte(buffer) while buffer.bytesize > 0
       end
 
@@ -891,10 +1330,14 @@ module MQTT
       # One or more topic paths to unsubscribe from
       attr_accessor :topics
 
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
       # Default attribute values
       ATTR_DEFAULTS = {
         :topics => [],
-        :flags => [false, true, false, false]
+        :flags => [false, true, false, false],
+        :properties => {}
       }
 
       # Create a new Unsubscribe packet
@@ -911,6 +1354,7 @@ module MQTT
       def encode_body
         raise 'no topics given when serialising packet' if @topics.empty?
         body = encode_short(@id)
+        body += encode_properties(@properties) if mqtt5?
         topics.each { |topic| body += encode_string(topic) }
         body
       end
@@ -919,6 +1363,7 @@ module MQTT
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
+        @properties = mqtt5? ? shift_properties(buffer) : {}
         @topics << shift_string(buffer) while buffer.bytesize > 0
       end
 
@@ -940,23 +1385,47 @@ module MQTT
 
     # Class representing an MQTT Unsubscribe Acknowledgment packet
     class Unsuback < MQTT::Packet
+      # An array of MQTT 5 reason codes, ordered by the filters that were
+      # unsubscribed from
+      attr_accessor :reason_codes
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
       # Create a new Unsubscribe Acknowledgment packet
+      ATTR_DEFAULTS = { :reason_codes => nil, :properties => {} }
+
       def initialize(args = {})
-        super(args)
+        super(ATTR_DEFAULTS.merge(args))
+      end
+
+      def reason_codes=(value)
+        @reason_codes = value.nil? ? [] : Array(value)
       end
 
       # Get serialisation of packet's body
       def encode_body
-        encode_short(@id)
+        body = encode_short(@id)
+        return body unless mqtt5?
+        body += encode_properties(@properties)
+        body += encode_bytes(*@reason_codes) unless @reason_codes.nil? || @reason_codes.empty?
+        body
       end
 
       # Parse the body (variable header and payload) of a packet
       def parse_body(buffer)
         super(buffer)
         @id = shift_short(buffer)
-
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Unsubscribe Acknowledgment packet'
+        if mqtt5?
+          @properties = shift_properties(buffer)
+          @reason_codes = []
+          @reason_codes << shift_byte(buffer) while buffer.bytesize > 0
+        else
+          @properties = {}
+          @reason_codes = nil
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Unsubscribe Acknowledgment packet'
+        end
       end
 
       # Returns a human readable string, summarising the properties of the packet
@@ -983,33 +1452,65 @@ module MQTT
 
     # Class representing an MQTT Ping Response packet
     class Pingresp < MQTT::Packet
+      # MQTT 5 reason code
+      attr_accessor :reason_code
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
+      ATTR_DEFAULTS = { :reason_code => 0x00, :properties => {} }
+
       # Create a new Ping Response packet
       def initialize(args = {})
-        super(args)
+        super(ATTR_DEFAULTS.merge(args))
       end
 
       # Check the body
       def parse_body(buffer)
         super(buffer)
 
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Ping Response packet'
+        if mqtt5?
+          @reason_code = buffer.empty? ? 0x00 : shift_byte(buffer)
+          @properties = buffer.empty? ? {} : shift_properties(buffer)
+        else
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Ping Response packet'
+        end
       end
     end
 
     # Class representing an MQTT Client Disconnect packet
     class Disconnect < MQTT::Packet
+      # MQTT 5 reason code
+      attr_accessor :reason_code
+
+      # Hash of MQTT 5 properties
+      attr_accessor :properties
+
+      ATTR_DEFAULTS = { :reason_code => 0x00, :properties => {} }
+
       # Create a new Client Disconnect packet
       def initialize(args = {})
-        super(args)
+        super(ATTR_DEFAULTS.merge(args))
+      end
+
+      # Get serialisation of packet's body
+      def encode_body
+        return '' unless mqtt5?
+        encode_bytes(@reason_code.to_i) + encode_properties(@properties)
       end
 
       # Check the body
       def parse_body(buffer)
         super(buffer)
 
-        return if buffer.empty?
-        raise ProtocolException, 'Extra bytes at end of Disconnect packet'
+        if mqtt5?
+          @reason_code = buffer.empty? ? 0x00 : shift_byte(buffer)
+          @properties = buffer.empty? ? {} : shift_properties(buffer)
+        else
+          return if buffer.empty?
+          raise ProtocolException, 'Extra bytes at end of Disconnect packet'
+        end
       end
     end
 

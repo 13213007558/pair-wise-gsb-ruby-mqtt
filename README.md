@@ -142,6 +142,37 @@ client.subscribe( 'foo/#' )
 
 For more information see the [MQTT::Client#subscribe] method.
 
+### MQTT 5 Subscription Identifiers ###
+
+When connected using MQTT version 5.0, a logical subscription can be given
+a Subscription Identifier. All of the filters in a SUBSCRIBE packet that
+share an identifier belong to the same logical subscription:
+
+~~~ ruby
+client = MQTT::Client.new('localhost', :version => '5.0')
+client.subscribe('sensor/+/temperature', 'sensor/#', :identifier => 42)
+~~~
+
+A callback can be registered for a logical subscription with `on_message`.
+It is called once per incoming PUBLISH packet that matches the subscription,
+even when several of the subscription's filters match. The yielded object is
+a single message event containing all of the Subscription Identifiers the
+server attached to the PUBLISH packet and the list of matching filters:
+
+~~~ ruby
+client.on_message('sensor/+', :identifier => 42) do |message|
+  puts message.topic                 # topic the PUBLISH was sent to
+  puts message.identifiers.inspect   # all Subscription Identifiers
+  message.matches.each do |match|
+    puts "#{match.identifier} matched #{match.filter}"
+  end
+end
+~~~
+
+The same event can also be consumed without a callback via `get_message`.
+Shared subscription filters (e.g. `$share/group/sensor/+`) are matched using
+only the filter part — the group name never takes part in topic matching.
+
 
 ### Receiving Messages ###
 
@@ -236,4 +267,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-

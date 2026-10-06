@@ -4,6 +4,102 @@ autoload :URI, 'uri'
 # Client class for talking to an MQTT server
 module MQTT
   class Client
+    # A single logical subscription: either identified by an MQTT 5
+    # Subscription Identifier, or an anonymous subscription for MQTT 3.
+    class Subscription
+      # The Subscription Identifier (nil for anonymous subscriptions)
+      attr_reader :identifier
+
+      # Optional callback invoked when a message matches the subscription
+      attr_accessor :handler
+
+      # Hash of active filters in this logical subscription:
+      # filter_string => granted maximum QoS level
+      attr_reader :filters
+
+      def initialize(identifier = nil, handler = nil)
+        @identifier = identifier
+        @handler = handler
+        @filters = {}
+      end
+
+      # Returns true when this subscription is identified
+      def identified?
+        !@identifier.nil?
+      end
+
+      def add_filter(filter, qos)
+        @filters[filter] = qos
+      end
+
+      def remove_filter(filter)
+        @filters.delete(filter)
+      end
+
+      def empty?
+        @filters.empty?
+      end
+    end
+
+    # One filter that matched an incoming message
+    SubscriptionMatch = Struct.new(:subscription, :filter, :qos) do
+      # The Subscription Identifier of the logical subscription (may be nil)
+      def identifier
+        subscription.identifier
+      end
+    end
+
+    # A single received message event.
+    # One ReceivedMessage is created per incoming PUBLISH packet, even when
+    # the packet matches several subscribed filters.
+    class ReceivedMessage
+      # The raw PUBLISH packet that was received
+      attr_reader :packet
+
+      # All Subscription Identifier values carried by the PUBLISH packet
+      attr_reader :identifiers
+
+      # Every filter that matched the topic, as SubscriptionMatch objects
+      attr_reader :matches
+
+      def initialize(packet, identifiers, matches)
+        @packet = packet
+        @identifiers = identifiers
+        @matches = matches
+        @acknowledged = false
+      end
+
+      def topic
+        @packet.topic
+      end
+
+      def payload
+        @packet.payload
+      end
+
+      def qos
+        @packet.qos
+      end
+
+      def retain
+        @packet.retain
+      end
+
+      # Whether a QoS acknowledgement has already been sent for this message
+      def acknowledged?
+        @acknowledged
+      end
+
+      def mark_acknowledged
+        @acknowledged = true
+      end
+
+      # The logical subscriptions that matched, without duplicates
+      def subscriptions
+        matches.map(&:subscription).uniq
+      end
+    end
+
     # Hostname of the remote server
     attr_accessor :host
 
@@ -176,10 +272,23 @@ module MQTT
       @last_ping_response = current_time
       @socket = nil
       @read_queue = Queue.new
+      @message_queue = Queue.new
       @pubacks = {}
       @read_thread = nil
       @write_semaphore = Mutex.new
       @pubacks_semaphore = Mutex.new
+      @subscription_semaphore = Mutex.new
+
+      # Active logical subscriptions, keyed by identifier (positive integers)
+      # or by negative integers for anonymous subscriptions
+      @subscriptions = {}
+      # Map of active filter strings to the keys of the subscriptions holding them
+      @filter_index = Hash.new { |hash, key| hash[key] = [] }
+      # SUBSCRIBE packet id => pending subscription information
+      @pending_subscribes = {}
+      # UNSUBSCRIBE packet id => filters pending removal
+      @pending_unsubscribes = {}
+      @anonymous_key = 0
     end
 
     # Get the OpenSSL context, that is used if SSL/TLS is enabled
@@ -317,6 +426,17 @@ module MQTT
       @socket = nil
     end
 
+    # Clear all locally-tracked subscription state. Called when the
+    # connection is lost.
+    def clear_subscriptions
+      @subscription_semaphore.synchronize do
+        @subscriptions.clear
+        @filter_index.clear
+        @pending_subscribes.clear
+        @pending_unsubscribes.clear
+      end
+    end
+
     # Checks whether the client is connected to the server.
     def connected?
       !@socket.nil? && !@socket.closed?
@@ -332,7 +452,8 @@ module MQTT
         :qos => qos,
         :retain => retain,
         :topic => topic,
-        :payload => payload
+        :payload => payload,
+        :version => @version
       )
 
       queue = qos.zero? ? nil : wait_for_puback(packet.id)
@@ -373,12 +494,35 @@ module MQTT
     #   client.subscribe( ['a/b',0], ['c/d',1] )
     #   client.subscribe( 'a/b' => 0, 'c/d' => 1 )
     #
-    def subscribe(*topics)
+    # Returns the id of the SUBSCRIBE packet that was sent.
+    #
+    # With MQTT 5 a Subscription Identifier can be associated with the
+    # logical subscription. All filters in the same SUBSCRIBE packet that
+    # share an identifier belong to the same logical subscription:
+    #   client.subscribe('a/b', 'c/d', :identifier => 42)
+    #
+    # An optional block is registered as a callback for messages matching
+    # the logical subscription. It receives a ReceivedMessage.
+    #
+    def subscribe(*args, &block)
+      identifier, topics = extract_subscription_options(args)
+      identifier = validate_subscription_identifier(identifier)
+
       packet = MQTT::Packet::Subscribe.new(
         :id => next_packet_id,
-        :topics => topics
+        :topics => topics,
+        :version => @version
       )
-      send_packet(packet)
+      packet.subscription_identifier = identifier unless identifier.nil?
+
+      register_pending_subscription(packet, identifier, block)
+      begin
+        send_packet(packet)
+      rescue StandardError
+        abandon_pending_subscription(packet.id)
+        raise
+      end
+      packet.id
     end
 
     # Return the next message received from the MQTT server.
@@ -451,17 +595,77 @@ module MQTT
     # Clear the incoming message queue.
     def clear_queue
       @read_queue.clear
+      @message_queue.clear
+    end
+
+    # Return the next received message as a ReceivedMessage object.
+    #
+    # Unlike {#get}, the returned object retains all of the Subscription
+    # Identifiers on the PUBLISH packet and lists every local subscription
+    # whose filters matched the topic.
+    #
+    # With a block the method loops, yielding one ReceivedMessage per
+    # PUBLISH packet (never duplicates for multiple matching filters):
+    #   client.get_message do |message|
+    #     puts message.topic
+    #     message.matches.each { |match| ... }
+    #   end
+    #
+    def get_message(options = {})
+      if block_given?
+        loop do
+          message = next_message
+          next if message.packet.retain && options[:omit_retained]
+          yield(message)
+        end
+      else
+        loop do
+          message = next_message
+          next if message.packet.retain && options[:omit_retained]
+          return message
+        end
+      end
+    end
+
+    # Subscribe and register a block handler for the logical subscription.
+    # The block is invoked once per message that matches the subscription
+    # and receives a ReceivedMessage. Returns the SUBSCRIBE packet id.
+    def on_message(*args, &block)
+      raise ArgumentError, 'a block must be given to #on_message' if block.nil?
+      identifier, topics = extract_subscription_options(args)
+      subscribe(*topics, :identifier => identifier, &block)
+    end
+
+    # All currently active logical subscriptions
+    def subscriptions
+      @subscription_semaphore.synchronize { @subscriptions.values.dup }
+    end
+
+    # Look up an active logical subscription by its Subscription Identifier
+    def subscription(identifier)
+      @subscription_semaphore.synchronize { @subscriptions[identifier] }
     end
 
     # Send a unsubscribe message for one or more topics on the MQTT server
-    def unsubscribe(*topics)
+    def unsubscribe(*args)
+      identifier, topics = extract_subscription_options(args)
       topics = topics.first if topics.is_a?(Enumerable) && topics.count == 1
+      filters = Array(topics)
+      identifier = validate_subscription_identifier(identifier)
 
       packet = MQTT::Packet::Unsubscribe.new(
-        :topics => topics,
-        :id => next_packet_id
+        :topics => filters,
+        :id => next_packet_id,
+        :version => @version
       )
-      send_packet(packet)
+      register_pending_unsubscription(packet.id, filters, identifier)
+      begin
+        send_packet(packet)
+      rescue StandardError
+        abandon_pending_unsubscription(packet.id)
+        raise
+      end
+      packet.id
     end
 
     private
@@ -474,7 +678,7 @@ module MQTT
       handle_timeouts
       unless result.nil?
         # Yes - read in the packet
-        packet = MQTT::Packet.read(@socket)
+        packet = MQTT::Packet.read(@socket, @version)
         handle_packet packet
       end
       keep_alive!
@@ -484,6 +688,7 @@ module MQTT
         @socket.close
         @socket = nil
         handle_close
+        clear_subscriptions
       end
       Thread.current[:parent].raise(exp)
     end
@@ -496,17 +701,259 @@ module MQTT
 
     def handle_packet(packet)
       if packet.class == MQTT::Packet::Publish
-        # Add to queue
+        message = build_received_message(packet)
+        # A single PUBLISH packet forms a single message event
         @read_queue.push(packet)
+        @message_queue.push(message)
+        dispatch_message(message)
       elsif packet.class == MQTT::Packet::Pingresp
         @last_ping_response = current_time
       elsif packet.class == MQTT::Packet::Puback
         @pubacks_semaphore.synchronize do
           @pubacks[packet.id] << packet if @pubacks[packet.id]
         end
+      elsif packet.class == MQTT::Packet::Suback
+        handle_suback(packet)
+      elsif packet.class == MQTT::Packet::Unsuback
+        handle_unsuback(packet)
       end
       # Ignore all other packets
       # FIXME: implement responses for QoS  2
+    end
+
+    # Find every active filter matching the topic of a PUBLISH packet and
+    # construct a single ReceivedMessage event.
+    def build_received_message(packet)
+      identifiers = packet.respond_to?(:subscription_identifiers) ? packet.subscription_identifiers : []
+
+      matches = []
+      seen = {}
+      add_match = lambda do |subscription, filter, qos|
+        identity = [subscription, filter]
+        return if seen[identity]
+        seen[identity] = true
+        matches << SubscriptionMatch.new(subscription, filter, qos)
+      end
+
+      @subscription_semaphore.synchronize do
+        # 1) Subscriptions pointed to by the identifiers carried in the packet
+        identifiers.each do |identifier|
+          subscription = @subscriptions[identifier]
+          next if subscription.nil?
+          subscription.filters.each do |filter, qos|
+            add_match.call(subscription, filter, qos) if MQTT::TopicFilter.match?(filter, packet.topic)
+          end
+        end
+
+        # 2) Any other active filters matching the topic (covers anonymous and
+        #    locally-tracked subscriptions that did not carry an identifier)
+        @filter_index.each do |filter, keys|
+          next unless MQTT::TopicFilter.match?(filter, packet.topic)
+          keys.each do |key|
+            subscription = @subscriptions[key]
+            next if subscription.nil?
+            add_match.call(subscription, filter, subscription.filters[filter])
+          end
+        end
+      end
+
+      ReceivedMessage.new(packet, identifiers, matches)
+    end
+
+    # Invoke registered handlers. A handler for a logical subscription is
+    # called at most once per message, even if several of its filters match.
+    def dispatch_message(message)
+      handlers = @subscription_semaphore.synchronize do
+        message.matches.map(&:subscription).uniq.map(&:handler).compact
+      end
+      handlers.each do |handler|
+        handler.call(message)
+      end
+      acknowledge_message(message)
+    end
+
+    def acknowledge_message(message)
+      return unless message.qos > 0
+      return if message.acknowledged?
+      message.mark_acknowledged
+      puback_packet(message.packet)
+    end
+
+    def next_message
+      message = @message_queue.pop
+      acknowledge_message(message)
+      message
+    end
+
+    def handle_suback(packet)
+      @subscription_semaphore.synchronize do
+        pending = @pending_subscribes.delete(packet.id)
+        return if pending.nil?
+
+        filters = pending[:filters]
+        codes = packet.return_codes
+        return_codes = codes.is_a?(Array) ? codes : [codes]
+
+      filters.each_with_index do |entry, index|
+        code = return_codes[index]
+        next if code.nil? || subscription_failed?(code)
+
+          filter = entry[:filter]
+          key = pending[:key]
+          subscription = @subscriptions[key]
+          next if subscription.nil?
+          granted_qos = mqtt5? ? code & 0x03 : code
+          subscription.add_filter(filter, granted_qos)
+          @filter_index[filter] << key unless @filter_index[filter].include?(key)
+        end
+
+        # Remove the logical subscription if none of its filters were granted
+        key = pending[:key]
+        subscription = @subscriptions[key]
+        if subscription && subscription.empty? && !pending_other_key?(key, packet.id)
+          @subscriptions.delete(key)
+        end
+      end
+    end
+
+    def handle_unsuback(packet)
+      @subscription_semaphore.synchronize do
+        pending = @pending_unsubscribes.delete(packet.id)
+        return if pending.nil?
+
+        pending[:filters].each_with_index do |filter, index|
+          next unless unsubscription_succeeded?(packet, index)
+          remove_filter_mapping_locked(filter, pending[:key])
+        end
+      end
+    end
+
+    # Failure codes are any value that is not a granted QoS level (0-2).
+    # MQTT 5 uses 0x80 and above for failures; MQTT 3.1.1 uses 0x80.
+    def subscription_failed?(code)
+      code > 0x02
+    end
+
+    # In MQTT 5 the UNSUBACK may report a failure per filter (reason >= 0x80);
+    # in that case the local mapping must be kept. MQTT 3.1.1 has no payload
+    # reason codes, so removal always succeeds.
+    def unsubscription_succeeded?(packet, index)
+      codes = packet.reason_codes
+      return true if codes.nil?
+      code = codes[index]
+      return true if code.nil?
+      code < 0x80
+    end
+
+    def remove_filter_mapping(filter, key)
+      @subscription_semaphore.synchronize do
+        remove_filter_mapping_locked(filter, key)
+      end
+    end
+
+    def remove_filter_mapping_locked(filter, key)
+      if key.nil?
+        # Remove the filter from every logical subscription holding it
+        (@filter_index[filter] || []).each do |existing_key|
+          subscription = @subscriptions[existing_key]
+          next if subscription.nil?
+          subscription.remove_filter(filter)
+          @subscriptions.delete(existing_key) if subscription.empty? &&
+                                                 !pending_subscription_key?(existing_key)
+        end
+        @filter_index.delete(filter)
+      else
+        subscription = @subscriptions[key]
+        return if subscription.nil?
+        subscription.remove_filter(filter)
+        @filter_index[filter].delete(key)
+        @filter_index.delete(filter) if @filter_index[filter].empty?
+        @subscriptions.delete(key) if subscription.empty? && !pending_subscription_key?(key)
+      end
+    end
+
+    def pending_subscription_key?(key)
+      @pending_subscribes.each_value.any? { |pending| pending[:key] == key }
+    end
+
+    def pending_other_key?(key, current_packet_id)
+      @pending_subscribes.each do |packet_id, pending|
+        next if packet_id == current_packet_id
+        return true if pending[:key] == key
+      end
+      false
+    end
+
+    def register_pending_subscription(packet, identifier, handler)
+      @subscription_semaphore.synchronize do
+        key = identifier || next_anonymous_key
+        subscription = @subscriptions.fetch(key) do
+          @subscriptions[key] = Subscription.new(identifier)
+        end
+        subscription.handler = handler unless handler.nil?
+        @pending_subscribes[packet.id] = {
+          :key => key,
+          :filters => packet.topic_filters.map { |filter| { :filter => filter } }
+        }
+      end
+    end
+
+    def abandon_pending_subscription(packet_id)
+      @subscription_semaphore.synchronize do
+        pending = @pending_subscribes.delete(packet_id)
+        unless pending.nil?
+          key = pending[:key]
+          subscription = @subscriptions[key]
+          if subscription && subscription.empty? && !pending_subscription_key?(key)
+            @subscriptions.delete(key)
+          end
+        end
+      end
+    end
+
+    def register_pending_unsubscription(packet_id, filters, identifier)
+      @subscription_semaphore.synchronize do
+        @pending_unsubscribes[packet_id] = {
+          :key => identifier,
+          :filters => filters
+        }
+      end
+    end
+
+    def abandon_pending_unsubscription(packet_id)
+      @subscription_semaphore.synchronize { @pending_unsubscribes.delete(packet_id) }
+    end
+
+    def validate_subscription_identifier(identifier)
+      return nil if identifier.nil?
+      number = Integer(identifier)
+      if number < 1 || number > 268_435_455
+        raise ArgumentError, 'Subscription identifier must be between 1 and 268435455'
+      end
+      raise ArgumentError, 'Subscription identifiers require MQTT version 5.0' unless mqtt5?
+      number
+    end
+
+    # Separate trailing client options from topic arguments.
+    # A trailing hash is treated as topic filters unless it contains the
+    # client-side :identifier option key.
+    def extract_subscription_options(args)
+      args = args.dup
+      options = {}
+      if args.last.is_a?(Hash) && (args.last.key?(:identifier) || args.last.key?('identifier'))
+        options = args.pop
+      end
+      identifier = options[:identifier] || options['identifier']
+      [identifier, args]
+    end
+
+    def mqtt5?
+      @version.to_s == '5.0'
+    end
+
+    def next_anonymous_key
+      @anonymous_key -= 1
+      @anonymous_key
     end
 
     def handle_timeouts
@@ -546,13 +993,13 @@ module MQTT
     end
 
     def puback_packet(packet)
-      send_packet(MQTT::Packet::Puback.new(:id => packet.id))
+      send_packet(MQTT::Packet::Puback.new(:id => packet.id, :version => @version))
     end
 
     # Read and check a connection acknowledgement packet
     def receive_connack
       Timeout.timeout(@ack_timeout) do
-        packet = MQTT::Packet.read(@socket)
+        packet = MQTT::Packet.read(@socket, @version)
         if packet.class != MQTT::Packet::Connack
           raise MQTT::ProtocolException, "Response wasn't a connection acknowledgement: #{packet.class}"
         end

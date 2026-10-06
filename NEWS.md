@@ -1,6 +1,20 @@
 Ruby MQTT NEWS
 ==============
 
+Unreleased
+----------
+
+* Added MQTT 5 (protocol version 5.0) support for packet properties and reason codes
+* Added Subscription Identifier support: `subscribe(..., :identifier => n)`,
+  with all returned identifiers retained on received PUBLISH packets
+* Added `MQTT::Client::ReceivedMessage`, `#get_message` and `#on_message`
+  for dispatching one message event per packet, listing every filter that
+  matched
+* Added `MQTT::TopicFilter` for wildcard matching; shared subscription group
+  names (`$share/<group>/...`) never take part in topic matching
+* SUBACK partial failures and UNSUBSCRIBE now update the local subscription
+  mappings accurately, including per-filter MQTT 5 UNSUBACK reason codes
+
 Ruby MQTT Version 0.7.0 (2025-10-29)
 ------------------------------------
 
