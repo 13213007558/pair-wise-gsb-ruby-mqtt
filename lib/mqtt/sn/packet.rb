@@ -583,7 +583,21 @@ module MQTT
       end
 
       class Pingreq < Packet
-        # No attributes
+        attr_accessor :client_id
+
+        DEFAULTS = {
+          :client_id => nil
+        }
+
+        # Get serialisation of packet's body
+        # (the ClientId is only present when a sleeping client wakes up)
+        def encode_body
+          client_id.nil? ? '' : client_id
+        end
+
+        def parse_body(buffer)
+          self.client_id = buffer.empty? ? nil : buffer
+        end
       end
 
       class Pingresp < Packet

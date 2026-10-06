@@ -1,6 +1,17 @@
 Ruby MQTT NEWS
 ==============
 
+Unreleased
+----------
+
+* Added MQTT::SN::Session: a client session for a fixed MQTT-SN gateway
+  with connect, QoS 0/1 publish/subscribe, sleeping-device support
+  (DISCONNECT with duration, wake via PINGREQ with ClientId) and
+  keep-alives while awake; transport and clock are caller-supplied
+* MQTT::SN::Packet::Pingreq now carries an optional ClientId, as sent
+  by sleeping clients when they wake up
+
+
 Ruby MQTT Version 0.7.0 (2025-10-29)
 ------------------------------------
 

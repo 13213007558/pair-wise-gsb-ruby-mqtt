@@ -1494,6 +1494,29 @@ describe MQTT::SN::Packet::Pingreq do
     it "should correctly create the right type of packet object" do
       expect(packet.class).to eq(MQTT::SN::Packet::Pingreq)
     end
+
+    it "should have no client id" do
+      expect(packet.client_id).to be_nil
+    end
+  end
+
+  describe "when serialising a packet with a client id" do
+    it "should output the correct bytes" do
+      packet = MQTT::SN::Packet::Pingreq.new(:client_id => 'sensor-1')
+      expect(packet.to_s).to eq("\x0A\x16sensor-1")
+    end
+  end
+
+  describe "when parsing a Pingreq packet with a client id" do
+    let(:packet) { MQTT::SN::Packet.parse("\x0A\x16sensor-1") }
+
+    it "should correctly create the right type of packet object" do
+      expect(packet.class).to eq(MQTT::SN::Packet::Pingreq)
+    end
+
+    it "should have the client id from the body" do
+      expect(packet.client_id).to eq('sensor-1')
+    end
   end
 end
 

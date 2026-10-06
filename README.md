@@ -187,6 +187,43 @@ socket << MQTT::SN::Packet::Publish.new(
 socket.close
 ~~~
 
+### MQTT-SN sensor sessions ###
+
+MQTT::SN::Session drives the MQTT-SN packet classes as a client session
+with a single, fixed gateway. It supports connecting, publishing and
+receiving at QoS 0 and 1, subscribing, and the sleeping-device flow:
+DISCONNECT with a duration to sleep, PINGREQ with the ClientId to wake
+up and drain the messages the gateway buffered, and keep-alive pings
+while awake (never while asleep).
+
+The datagram transport and the clock are supplied by the caller, so the
+session runs over UDP, tests, or anything else that can send and
+receive datagrams:
+
+~~~ ruby
+session = MQTT::SN::Session.new(
+  :transport => transport,  # responds to send(bytes) and recv
+  :clock => clock,          # responds to now and sleep(seconds)
+  :client_id => 'sensor-1',
+  :keep_alive => 60
+)
+session.on_message = lambda { |packet| puts packet.data }
+session.on_event = lambda { |event, *details| puts [event, *details].inspect }
+
+session.connect
+topic_id = session.subscribe('sensors/temp', :qos => 1)
+session.publish(topic_id, '22.5', :qos => 1)
+session.tick          # call regularly: receives and sends keep-alives
+session.sleep(1800)   # DISCONNECT with a duration
+session.wake          # PINGREQ with ClientId, drains buffered messages
+session.disconnect
+~~~
+
+Timeouts, the gateway dropping the session, and client-initiated
+shutdown are observable through the +state+ reader and the +on_event+
+callback. See examples/mqttsn_sleep_cycle.rb for a complete run against
+a scripted gateway.
+
 Limitations
 -----------
 
@@ -236,4 +273,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-
