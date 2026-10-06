@@ -947,6 +947,13 @@ describe MQTT::SN::Packet::Puback do
       packet = MQTT::SN::Packet::Puback.new(:topic_id => "0x45")
       expect { packet.to_s }.to raise_error("topic_id must be an Integer")
     end
+
+    it "should output the correct bytes for a short topic id" do
+      packet = MQTT::SN::Packet::Puback.new(
+        :id => 0x02, :topic_id => 'TT', :topic_id_type => :short
+      )
+      expect(packet.to_s).to eq("\x07\x0D\x54\x54\x00\x02\x00")
+    end
   end
 
   describe "when parsing a PUBACK packet" do
@@ -1486,6 +1493,10 @@ describe MQTT::SN::Packet::Pingreq do
       packet = MQTT::SN::Packet::Pingreq.new
       expect(packet.to_s).to eq("\x02\x16")
     end
+    it "should output the correct bytes for a wake-up pingreq carrying a client id" do
+      packet = MQTT::SN::Packet::Pingreq.new(:client_id => 'sensor-1')
+      expect(packet.to_s).to eq("\x0A\x16sensor-1")
+    end
   end
 
   describe "when parsing a Pingreq packet" do
@@ -1493,6 +1504,17 @@ describe MQTT::SN::Packet::Pingreq do
 
     it "should correctly create the right type of packet object" do
       expect(packet.class).to eq(MQTT::SN::Packet::Pingreq)
+    end
+    it "should have no client id" do
+      expect(packet.client_id).to be_nil
+    end
+  end
+
+  describe "when parsing a wake-up Pingreq packet" do
+    let(:packet) { MQTT::SN::Packet.parse("\x0A\x16sensor-1") }
+
+    it "should set the client id of the packet" do
+      expect(packet.client_id).to eq('sensor-1')
     end
   end
 end

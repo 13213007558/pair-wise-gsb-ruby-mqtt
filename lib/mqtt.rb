@@ -43,6 +43,23 @@ module MQTT
     class ProtocolException < MQTT::Exception
     end
 
-    autoload :Packet, 'mqtt/sn/packet'
+    # A NotConnectedException will be raised when trying to perform
+    # an operation that requires an established session
+    class NotConnectedException < MQTT::NotConnectedException
+    end
+
+    # A TimeoutException will be raised when an acknowledgement or
+    # response packet is not received in time
+    class TimeoutException < MQTT::Exception
+    end
+
+    # A SessionLostException will be raised when the gateway sends an
+    # unsolicited DISCONNECT, such as when the sleep duration expires
+    class SessionLostException < MQTT::Exception
+    end
+
+    autoload :Client,       'mqtt/sn/client'
+    autoload :Packet,       'mqtt/sn/packet'
+    autoload :UDPTransport, 'mqtt/sn/udp_transport'
   end
 end

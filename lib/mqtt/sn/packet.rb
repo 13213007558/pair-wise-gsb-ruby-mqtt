@@ -423,19 +423,28 @@ module MQTT
         DEFAULTS = {
           :id => 0x00,
           :topic_id => nil,
-          :return_code => 0x00
+          :return_code => 0x00,
+          :topic_id_type => :normal
         }
 
         def encode_body
           raise 'id must be an Integer' unless id.is_a?(Integer)
 
-          raise 'topic_id must be an Integer' unless topic_id.is_a?(Integer)
+          topic = if topic_id_type == :short
+                    raise 'topic_id must be an String' unless topic_id.is_a?(String)
 
-          [topic_id, id, return_code].pack('nnC')
+                    encode_topic_id
+                  else
+                    raise 'topic_id must be an Integer' unless topic_id.is_a?(Integer)
+
+                    topic_id
+                  end
+          [topic, id, return_code].pack('nnC')
         end
 
         def parse_body(buffer)
-          self.topic_id, self.id, self.return_code = buffer.unpack('nnC')
+          topic_id, self.id, self.return_code = buffer.unpack('nnC')
+          parse_topic_id(topic_id)
         end
       end
 
@@ -583,7 +592,22 @@ module MQTT
       end
 
       class Pingreq < Packet
-        # No attributes
+        # Client identifier, used by a sleeping client when waking up.
+        # An empty (nil) client id produces the 2-byte keep-alive PINGREQ
+        # used by an awake client.
+        attr_accessor :client_id
+
+        DEFAULTS = {
+          :client_id => nil
+        }
+
+        def encode_body
+          client_id.nil? ? '' : client_id
+        end
+
+        def parse_body(buffer)
+          self.client_id = buffer.empty? ? nil : buffer
+        end
       end
 
       class Pingresp < Packet

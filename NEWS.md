@@ -1,6 +1,13 @@
 Ruby MQTT NEWS
 ==============
 
+Ruby MQTT Version 0.7.0 (unreleased)
+----------------------------------
+
+* Added MQTT-SN client sessions (connect, QoS 0/1, sleep and wake)
+* Added a UDP datagram transport and an injectable clock interface for MQTT-SN
+* PINGREQ packets may carry a client id (used by sleeping clients on wake-up)
+
 Ruby MQTT Version 0.7.0 (2025-10-29)
 ------------------------------------
 

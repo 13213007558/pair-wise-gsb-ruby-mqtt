@@ -187,6 +187,36 @@ socket << MQTT::SN::Packet::Publish.new(
 socket.close
 ~~~
 
+MQTT-SN client sessions
+----------------------
+
+An `MQTT::SN::Client` drives the MQTT-SN packet classes over a datagram
+transport. It talks to a fixed gateway, connects, sends and receives QoS 0
+and QoS 1 messages, and supports the MQTT-SN sleep/wake cycle. The clock and
+the datagram transport are injected by the caller, so it can run against a
+plain UDP socket or a scripted transport in tests.
+
+~~~ ruby
+transport = MQTT::SN::UDPTransport.new('localhost', MQTT::SN::DEFAULT_PORT)
+client = MQTT::SN::Client.new(transport, :client_id => 'sensor-1', :keep_alive => 15)
+client.connect
+
+client.publish('TT', 'QoS 0 measurement')
+client.publish('TT', 'QoS 1 measurement', false, 1) # waits for the PUBACK
+
+# Stop normal traffic: no keep-alive PINGREQ is sent while asleep.
+granted = client.sleep(300)
+
+# Wake up, receive everything the gateway buffered, up to the PINGRESP.
+messages = client.wake
+
+client.disconnect
+~~~
+
+See `examples/mqttsn_sleep_wake.rb` for a runnable, gateway-less script that
+replays a whole connect / sleep / backlog / sleep round (including timeouts
+and the gateway dropping the session).
+
 Limitations
 -----------
 
@@ -236,4 +266,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-
