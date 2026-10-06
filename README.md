@@ -187,6 +187,39 @@ socket << MQTT::SN::Packet::Publish.new(
 socket.close
 ~~~
 
+### MQTT-SN client ###
+
+A lightweight MQTT-SN client state machine is also included. It performs no
+network I/O of its own: outbound datagrams are handed to a caller-provided UDP
+transport (any object responding to `send_data`) and inbound packets are fed
+back to the client.
+
+It supports gateway discovery, connecting, REGISTER/REGACK and publishing at
+QoS 0 and 1 using normal, predefined or short topic identifiers. Topic ID
+registrations are gateway-scoped, so they are discarded when switching gateway
+with `use_gateway`. Sleeping clients and QoS -1 are not supported: receiving
+related packets sets the client status to `:unsupported`.
+
+~~~ ruby
+# The transport is responsible for delivering datagrams over UDP
+transport = MyUdpTransport.new('gateway.example.com', MQTT::SN::DEFAULT_PORT)
+
+client = MQTT::SN::Client.new(transport, :client_id => 'my-sensor')
+client.discover          # broadcast SEARCHGW, select the first gateway
+client.connect
+
+# Normal topics are registered on first use, the publish is queued
+# until the REGACK arrives
+client.publish('sensors/temp', '21', :qos => 1)
+
+# Predefined and short topics are published without registration
+client.publish(7, 'preset', :topic_type => :predefined)
+client.publish('TT', 'short', :topic_type => :short)
+
+# Feed packets received from the UDP socket back to the client
+client.handle_packet(MQTT::SN::Packet.parse(datagram))
+~~~
+
 Limitations
 -----------
 
@@ -236,4 +269,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-
