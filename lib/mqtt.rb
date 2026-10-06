@@ -44,5 +44,6 @@ module MQTT
     end
 
     autoload :Packet, 'mqtt/sn/packet'
+    autoload :Discovery, 'mqtt/sn/discovery'
   end
 end

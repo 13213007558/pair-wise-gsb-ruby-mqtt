@@ -1,6 +1,13 @@
 Ruby MQTT NEWS
 ==============
 
+Ruby MQTT Git HEAD
+------------------
+
+* Added `MQTT::SN::Discovery`, a standalone MQTT-SN gateway discovery
+  component that processes SEARCHGW, GWINFO and ADVERTISE and reports
+  candidate gateways with validity periods
+
 Ruby MQTT Version 0.7.0 (2025-10-29)
 ------------------------------------
 

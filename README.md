@@ -187,6 +187,47 @@ socket << MQTT::SN::Packet::Publish.new(
 socket.close
 ~~~
 
+### MQTT-SN gateway discovery ###
+
+`MQTT::SN::Discovery` is a standalone component for sensors that do not know
+the address of their gateway. It processes `SEARCHGW`, `GWINFO` and
+`ADVERTISE` UDP datagrams and reports the currently selectable gateways and
+how long each remains valid. It performs no network I/O itself: outgoing
+datagrams are returned to the caller, and time is supplied with an injectable
+clock so behaviour is deterministic.
+
+Information advertised directly by a gateway is preferred over information
+relayed by another client. Expiry only removes a gateway from the set of
+choices; the component never declares an established MQTT session dead.
+Candidate counts and request/forward frequencies are capped, so repeated
+broadcasts are not amplified.
+
+~~~ ruby
+clock = MyFakeClock.new
+discovery = MQTT::SN::Discovery.new(:clock => clock.method(:now))
+BROADCAST = ['225.0.18.83', MQTT::SN::DEFAULT_PORT]
+
+# Ask for gateways (rate limited); send the returned datagram on UDP
+payload, destination = discovery.search!
+socket.send(payload, 0, *BROADCAST)
+
+# Feed inbound UDP datagrams, then pump the clock to flush delayed replies
+discovery.receive(data, remote_address)
+discovery.tick(clock.now).each do |packet, destination|
+  if destination == MQTT::SN::Discovery::BROADCAST_ADDRESS
+    socket.send(packet, 0, *BROADCAST)
+  else
+    # Destination is the opaque source address supplied in #receive
+  end
+end
+
+gateway = discovery.select_gateway
+if gateway
+  puts "Gateway ##{gateway.gateway_id} at #{gateway.address} " \
+       "(#{gateway.remaining(clock.now)}s, direct=#{gateway.direct?})"
+end
+~~~
+
 Limitations
 -----------
 
@@ -236,4 +277,3 @@ Contact
 [MQTT::Client#publish]:   http://rubydoc.info/gems/mqtt/MQTT/Client:publish
 [MQTT::Client#subscribe]: http://rubydoc.info/gems/mqtt/MQTT/Client:subscribe
 [MQTT::Client#get]:       http://rubydoc.info/gems/mqtt/MQTT/Client:get
-
